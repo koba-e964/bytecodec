@@ -42,10 +42,10 @@ impl StreamState {
 /// Read buffer.
 #[derive(Debug)]
 pub struct ReadBuf<B> {
-    inner: B,
-    head: usize,
-    tail: usize,
-    stream_state: StreamState,
+    pub(crate) inner: B,
+    pub(crate) head: usize,
+    pub(crate) tail: usize,
+    pub(crate) stream_state: StreamState,
 }
 impl<B: AsRef<[u8]> + AsMut<[u8]>> ReadBuf<B> {
     /// Makes a new `ReadBuf` instance.
@@ -101,7 +101,38 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> ReadBuf<B> {
     /// - The read buffer became full
     /// - A read operation returned a `WouldBlock` error
     /// - The input stream has reached EOS
-    pub fn fill<R: AsyncRead>(
+    pub fn fill<R: Read>(&mut self, mut reader: R) -> Result<()> {
+        while !self.is_full() {
+            match reader.read(&mut self.inner.as_mut()[self.tail..]) {
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        self.stream_state = StreamState::WouldBlock;
+                        break;
+                    } else {
+                        self.stream_state = StreamState::Error;
+                        return Err(track!(Error::from(e)));
+                    }
+                }
+                Ok(0) => {
+                    self.stream_state = StreamState::Eos;
+                    break;
+                }
+                Ok(size) => {
+                    self.stream_state = StreamState::Normal;
+                    self.tail += size;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fills the read buffer by reading bytes from the given reader.
+    ///
+    /// The fill process continues until one of the following condition is satisfied:
+    /// - The read buffer became full
+    /// - A read operation returned a `WouldBlock` error
+    /// - The input stream has reached EOS
+    pub fn poll_fill<R: AsyncRead>(
         self: &mut Self,
         mut reader: Pin<&mut R>,
         cx: &mut Context<'_>,
@@ -162,10 +193,10 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Read for ReadBuf<B> {
 /// Write buffer.
 #[derive(Debug)]
 pub struct WriteBuf<B> {
-    inner: B,
-    head: usize,
-    tail: usize,
-    stream_state: StreamState,
+    pub(crate) inner: B,
+    pub(crate) head: usize,
+    pub(crate) tail: usize,
+    pub(crate) stream_state: StreamState,
 }
 impl<B: AsRef<[u8]> + AsMut<[u8]>> WriteBuf<B> {
     /// Makes a new `WriteBuf` instance.
@@ -223,7 +254,44 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> WriteBuf<B> {
     /// - The write buffer became empty
     /// - A write operation returned a `WouldBlock` error
     /// - The output stream has reached EOS
-    pub fn flush<W: AsyncWrite>(
+    pub fn flush<W: Write>(&mut self, mut writer: W) -> Result<()> {
+        while !self.is_empty() {
+            match writer.write(&self.inner.as_ref()[self.head..self.tail]) {
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        self.stream_state = StreamState::WouldBlock;
+                        break;
+                    } else {
+                        self.stream_state = StreamState::Error;
+                        return Err(track!(Error::from(e)));
+                    }
+                }
+                Ok(0) => {
+                    self.stream_state = StreamState::Eos;
+                    break;
+                }
+                Ok(size) => {
+                    self.stream_state = StreamState::Normal;
+                    self.head += size;
+                    if self.head == self.tail {
+                        self.head = 0;
+                        self.tail = 0;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the encoded bytes contained in this buffer to the given writer.
+    ///
+    /// The written bytes will be removed from the buffer.
+    ///
+    /// The flush process continues until one of the following condition is satisfied:
+    /// - The write buffer became empty
+    /// - A write operation returned a `WouldBlock` error
+    /// - The output stream has reached EOS
+    pub fn poll_flush<W: AsyncWrite>(
         &mut self,
         mut writer: Pin<&mut W>,
         cx: &mut Context<'_>,
@@ -310,8 +378,8 @@ impl<T: AsyncRead + AsyncWrite> BufferedIo<T> {
     /// "I/O operation" means "filling the read buffer" and "flushing the write buffer".
     pub fn execute_io(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<()> {
         let mut this = self.project();
-        track!(this.rbuf.fill(this.stream.as_mut(), cx))?;
-        track!(this.wbuf.flush(this.stream.as_mut(), cx))?;
+        track!(this.rbuf.poll_fill(this.stream.as_mut(), cx))?;
+        track!(this.wbuf.poll_flush(this.stream.as_mut(), cx))?;
         Ok(())
     }
 
